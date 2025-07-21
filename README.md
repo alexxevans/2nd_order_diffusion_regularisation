@@ -61,7 +61,11 @@ main.py:
     (default: 'eval')
   --mode: <train|eval>: Running mode: train or eval
   --workdir: Working directory
+  --config.training.k= 'Set number of probes'
+  --config.training.gamma= 'Set 2nd order term weighting'
 ```
+
+Precision, recall, density and coverage are now included in the evaluation metrics.
 
 * `config` is the path to the config file. Our prescribed config files are provided in `configs/`. They are formatted according to [`ml_collections`](https://github.com/google/ml_collections) and should be quite self-explanatory.
 
@@ -83,6 +87,8 @@ main.py:
   * Compute the log-likelihood on the training or test dataset.
 
   These functionalities can be configured through config files, or more conveniently, through the command-line support of the `ml_collections` package. For example, to generate samples and evaluate sample quality, supply the  `--config.eval.enable_sampling` flag; to compute log-likelihoods, supply the `--config.eval.enable_bpd` flag, and specify `--config.eval.dataset=train/test` to indicate whether to compute the likelihoods on the training or test dataset.
+
+Precision, recall, density and coverage are now included in the evaluation metrics.
 
 ## How to extend the code
 * **New SDEs**: inherent the `sde_lib.SDE` abstract class and implement all abstract methods. The `discretize()` method is optional and the default is Euler-Maruyama discretization. Existing sampling methods and likelihood computation will automatically work for this new SDE.

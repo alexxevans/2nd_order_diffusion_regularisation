@@ -61,8 +61,24 @@ def optimization_manager(config):
 
   return optimize_fn
 
+def reg_fn(score_fn, x, labels, rng, k: int):
+  # split RNG for each probe
+  keys = jax.random.split(rng, k)
 
-def get_sde_loss_fn(sde, model, train, reduce_mean=True, continuous=True, likelihood_weighting=True, eps=1e-5):
+  def one_probe(key):
+    # draw eps from Rademacher
+    eps = jax.random.rademacher(key, x.shape).astype(x.dtype)
+    # compute JVP:  jvp(score_fn, (x,), (z,)) -> (score, J⋅z)
+    _, jvp = jax.jvp(lambda v: score_fn(v, labels), (x,), (eps,))
+    # inner product (z⋅(Jz))^2 for each sample, then flatten over pixels/channels
+    return jnp.sum(jnp.square(eps * jvp), axis=tuple(range(1, eps.ndim)))
+
+  # vmapped over probes gives shape (num_probes, batch)
+  traces = jax.vmap(one_probe)(keys)
+  # average over probes → (batch,)
+  return jnp.mean(traces, axis=0)
+
+def get_sde_loss_fn(sde, model, train, reduce_mean=True, continuous=True, likelihood_weighting=True, eps=1e-5, k=0, gamma=0.0):
   """Create a loss function for training with arbirary SDEs.
 
   Args:
@@ -115,13 +131,28 @@ def get_sde_loss_fn(sde, model, train, reduce_mean=True, continuous=True, likeli
       losses = jnp.square(score + batch_mul(z, 1. / std))
       losses = reduce_op(losses.reshape((losses.shape[0], -1)), axis=-1) * g2
 
-    loss = jnp.mean(losses)
-    return loss, new_model_state
+    base_loss = jnp.mean(losses)
+
+    def pure_score(x_in, t_in):
+      return score_fn(x_in, t_in, rng=step_rng)[0]
+
+    rng, reg_rng = random.split(rng)
+    raw_reg = reg_fn(
+      score_fn=pure_score,
+      x=perturbed_data,
+      labels=t,
+      rng=reg_rng,
+      k=k
+    )
+    reg = gamma * jnp.mean(raw_reg)
+
+    loss = base_loss + reg
+    return loss, (new_model_state, reg)
 
   return loss_fn
 
 
-def get_smld_loss_fn(vesde, model, train, reduce_mean=False):
+def get_smld_loss_fn(vesde, model, train, reduce_mean=False, k=0, gamma=0.0):
   """Legacy code to reproduce previous results on SMLD(NCSN). Not recommended for new work."""
   assert isinstance(vesde, VESDE), "SMLD training only works for VESDEs."
 
@@ -143,13 +174,29 @@ def get_smld_loss_fn(vesde, model, train, reduce_mean=False):
     target = -batch_mul(noise, 1. / (sigmas ** 2))
     losses = jnp.square(score - target)
     losses = reduce_op(losses.reshape((losses.shape[0], -1)), axis=-1) * sigmas ** 2
-    loss = jnp.mean(losses)
-    return loss, new_model_state
+
+    base_loss = jnp.mean(losses)
+
+    def pure_score(x_in, lbl_in):
+      return model_fn(x_in, lbl_in, rng=step_rng)[0]
+
+    rng, reg_rng = random.split(rng)
+    raw_reg = reg_fn(
+      score_fn=pure_score,
+      x=perturbed_data,
+      labels=labels,
+      rng=reg_rng,
+      k=k
+    )
+    reg = gamma * jnp.mean(raw_reg)
+
+    loss = base_loss + reg
+    return loss, (new_model_state, reg)
 
   return loss_fn
 
 
-def get_ddpm_loss_fn(vpsde, model, train, reduce_mean=True):
+def get_ddpm_loss_fn(vpsde, model, train, reduce_mean=True, k=0, gamma=0.0):
   """Legacy code to reproduce previous results on DDPM. Not recommended for new work."""
   assert isinstance(vpsde, VPSDE), "DDPM training only works for VPSDEs."
 
@@ -170,13 +217,29 @@ def get_ddpm_loss_fn(vpsde, model, train, reduce_mean=True):
     score, new_model_state = model_fn(perturbed_data, labels, rng=step_rng)
     losses = jnp.square(score - noise)
     losses = reduce_op(losses.reshape((losses.shape[0], -1)), axis=-1)
-    loss = jnp.mean(losses)
-    return loss, new_model_state
+
+    base_loss = jnp.mean(losses)
+
+    def pure_score(x_in, lbl_in):
+      return model_fn(x_in, lbl_in, rng=step_rng)[0]
+
+    rng, reg_rng = random.split(rng)
+    raw_reg = reg_fn(
+      score_fn=pure_score,
+      x=perturbed_data,
+      labels=labels,
+      rng=reg_rng,
+      k=k
+    )
+    reg = gamma * jnp.mean(raw_reg)
+
+    loss = base_loss + reg
+    return loss, (new_model_state, reg)
 
   return loss_fn
 
 
-def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False):
+def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False, k: float=0.0, gamma: float=0.0):
   """Create a one-step training/evaluation function.
 
   Args:
@@ -194,13 +257,13 @@ def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuo
   """
   if continuous:
     loss_fn = get_sde_loss_fn(sde, model, train, reduce_mean=reduce_mean,
-                              continuous=True, likelihood_weighting=likelihood_weighting)
+                              continuous=True, likelihood_weighting=likelihood_weighting, k=k, gamma=k)
   else:
     assert not likelihood_weighting, "Likelihood weighting is not supported for original SMLD/DDPM training."
     if isinstance(sde, VESDE):
-      loss_fn = get_smld_loss_fn(sde, model, train, reduce_mean=reduce_mean)
+      loss_fn = get_smld_loss_fn(sde, model, train, reduce_mean=reduce_mean, k=k, gamma=gamma)
     elif isinstance(sde, VPSDE):
-      loss_fn = get_ddpm_loss_fn(sde, model, train, reduce_mean=reduce_mean)
+      loss_fn = get_ddpm_loss_fn(sde, model, train, reduce_mean=reduce_mean, k=k, gamma=gamma)
     else:
       raise ValueError(f"Discrete training for {sde.__class__.__name__} is not recommended.")
 
@@ -225,7 +288,7 @@ def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuo
     if train:
       params = state.optimizer.target
       states = state.model_state
-      (loss, new_model_state), grad = grad_fn(step_rng, params, states, batch)
+      (loss, (new_model_state, reg)), grad = grad_fn(step_rng, params, states, batch)
       grad = jax.lax.pmean(grad, axis_name='batch')
       new_optimizer = optimize_fn(state, grad)
       new_params_ema = jax.tree_multimap(
@@ -240,11 +303,12 @@ def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuo
         params_ema=new_params_ema
       )
     else:
-      loss, _ = loss_fn(step_rng, state.params_ema, state.model_state, batch)
+      (loss, (_, reg)) = loss_fn(step_rng, state.params_ema, state.model_state, batch)
       new_state = state
 
     loss = jax.lax.pmean(loss, axis_name='batch')
+    reg = jax.lax.pmean(reg, axis_name='batch')
     new_carry_state = (rng, new_state)
-    return new_carry_state, loss
+    return new_carry_state, {'loss': loss, 'reg': reg}
 
   return step_fn

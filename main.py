@@ -35,6 +35,11 @@ flags.mark_flags_as_required(["workdir", "config", "mode"])
 
 
 def main(argv):
+  print("– GPUs at entry:   ", tf.config.list_physical_devices("GPU"))
+  print("– CUDA_HOME:       ", os.environ.get("CUDA_HOME"))
+  print("– CONDA_PREFIX:    ", os.environ.get("CONDA_PREFIX"))
+  print("– LD_LIBRARY_PATH: ", os.environ.get("LD_LIBRARY_PATH"))
+  print("– TF lib dir:      ", tf.sysconfig.get_lib())
   tf.config.experimental.set_visible_devices([], "GPU")
   os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 

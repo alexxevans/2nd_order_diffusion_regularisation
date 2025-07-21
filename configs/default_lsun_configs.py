@@ -19,6 +19,10 @@ def get_default_configs():
   training.n_jitted_steps = 5
   training.reduce_mean = False
 
+  # 2nd order regularisation
+  training.k=0
+  training.gamma=0.0
+
   # sampling
   config.sampling = sampling = ml_collections.ConfigDict()
   sampling.n_steps_each = 1

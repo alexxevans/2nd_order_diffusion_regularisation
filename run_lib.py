@@ -45,6 +45,8 @@ import likelihood
 import sde_lib
 from absl import flags
 
+from prdc import compute_prdc
+
 FLAGS = flags.FLAGS
 
 
@@ -119,12 +121,14 @@ def train(config, workdir):
   likelihood_weighting = config.training.likelihood_weighting
   train_step_fn = losses.get_step_fn(sde, score_model, train=True, optimize_fn=optimize_fn,
                                      reduce_mean=reduce_mean, continuous=continuous,
-                                     likelihood_weighting=likelihood_weighting)
+                                     likelihood_weighting=likelihood_weighting,
+                                     k=config.training.k, gamma=config.training.gamma)
   # Pmap (and jit-compile) multiple training steps together for faster running
   p_train_step = jax.pmap(functools.partial(jax.lax.scan, train_step_fn), axis_name='batch', donate_argnums=1)
   eval_step_fn = losses.get_step_fn(sde, score_model, train=False, optimize_fn=optimize_fn,
                                     reduce_mean=reduce_mean, continuous=continuous,
-                                    likelihood_weighting=likelihood_weighting)
+                                    likelihood_weighting=likelihood_weighting,
+                                    k=config.training.k, gamma=config.training.gamma)
   # Pmap (and jit-compile) multiple evaluation steps together for faster running
   p_eval_step = jax.pmap(functools.partial(jax.lax.scan, eval_step_fn), axis_name='batch', donate_argnums=1)
 
@@ -157,12 +161,16 @@ def train(config, workdir):
     rng, *next_rng = jax.random.split(rng, num=jax.local_device_count() + 1)
     next_rng = jnp.asarray(next_rng)
     # Execute one training step
-    (_, pstate), ploss = p_train_step((next_rng, pstate), batch)
-    loss = flax.jax_utils.unreplicate(ploss).mean()
+    (_, pstate), train_metrics = p_train_step((next_rng, pstate), batch)
+    train_metrics = flax.jax_utils.unreplicate(train_metrics)
     # Log to console, file and tensorboard on host 0
     if jax.host_id() == 0 and step % config.training.log_freq == 0:
-      logging.info("step: %d, training_loss: %.5e" % (step, loss))
-      writer.scalar("training_loss", loss, step)
+      train_loss = float(train_metrics['loss'])
+      train_reg = float(train_metrics['reg'])
+
+      logging.info(f"step: {step}, (TRAIN) loss: {train_loss:.5e}, reg: {train_reg:.5e}")
+      writer.scalar("training_loss", train_loss, step)
+      writer.scalar("training_reg", train_reg, step)
 
     # Save a temporary checkpoint to resume training after pre-emption periodically
     if step != 0 and step % config.training.snapshot_freq_for_preemption == 0 and jax.host_id() == 0:
@@ -177,11 +185,16 @@ def train(config, workdir):
       eval_batch = jax.tree_map(lambda x: scaler(x._numpy()), next(eval_iter))  # pylint: disable=protected-access
       rng, *next_rng = jax.random.split(rng, num=jax.local_device_count() + 1)
       next_rng = jnp.asarray(next_rng)
-      (_, _), peval_loss = p_eval_step((next_rng, pstate), eval_batch)
-      eval_loss = flax.jax_utils.unreplicate(peval_loss).mean()
+      (_, _), eval_metrics = p_eval_step((next_rng, pstate), eval_batch)
+      eval_metrics = flax.jax_utils.unreplicate(eval_metrics)
+
       if jax.host_id() == 0:
-        logging.info("step: %d, eval_loss: %.5e" % (step, eval_loss))
+        eval_loss = float(eval_metrics['loss'])
+        eval_reg = float(eval_metrics['reg'])
+
+        logging.info(f"step: {step}, (EVAL) loss: {eval_loss:.5e}, reg: {eval_reg:.5e}")
         writer.scalar("eval_loss", eval_loss, step)
+        writer.scalar("eval_reg", eval_reg, step)
 
     # Save a checkpoint periodically and generate samples if needed
     if step != 0 and step % config.training.snapshot_freq == 0 or step == num_train_steps:
@@ -539,14 +552,42 @@ def evaluate(config,
           tf_data_pools, tf_all_pools).numpy()
         del tf_data_pools, tf_all_pools
 
-        logging.info(
-          "ckpt-%d --- inception_score: %.6e, FID: %.6e, KID: %.6e" % (
-            ckpt, inception_score, fid, kid))
+        k = getattr(config.eval, "prdc_k", 5)
 
-        with tf.io.gfile.GFile(os.path.join(eval_dir, f"report_{ckpt}.npz"),
-                               "wb") as f:
+        rng = np.random.RandomState(config.seed)
+        real_idx = rng.choice(data_pools.shape[0], size=128, replace=False) # RANDOM SUB-SECTION OF SAMPLES
+        fake_idx = rng.choice(all_pools.shape[0], size=128, replace=False)
+
+        prdc = compute_prdc(real_features=data_pools[real_idx],
+                            fake_features=all_pools[fake_idx],
+                            nearest_k=k)
+        precision = prdc["precision"]
+        recall = prdc["recall"]
+        density = prdc["density"]
+        coverage = prdc["coverage"]
+
+        logging.info(
+          "ckpt-%d --- IS: %.6e, FID: %.6e, KID: %.6e, "
+          "Precision: %.6e, Recall: %.6e, Density: %.6e, Coverage: %.6e" % (
+            ckpt,
+            inception_score, fid, kid,
+            precision, recall,
+            density, coverage
+          )
+        )
+
+        with tf.io.gfile.GFile(os.path.join(eval_dir, f"report_{ckpt}.npz"), "wb") as f:
           io_buffer = io.BytesIO()
-          np.savez_compressed(io_buffer, IS=inception_score, fid=fid, kid=kid)
+          np.savez_compressed(
+            io_buffer,
+            IS=inception_score,
+            fid=fid,
+            kid=kid,
+            precision=precision,
+            recall=recall,
+            density=density,
+            coverage=coverage
+          )
           f.write(io_buffer.getvalue())
       else:
         # For host_id() != 0.
