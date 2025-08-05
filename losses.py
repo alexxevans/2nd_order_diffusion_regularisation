@@ -24,6 +24,9 @@ from models import utils as mutils
 from sde_lib import VESDE, VPSDE
 from utils import batch_mul
 
+import time
+import tracemalloc
+
 
 def get_optimizer(config):
   """Returns a flax optimizer object based on `config`."""
@@ -61,24 +64,66 @@ def optimization_manager(config):
 
   return optimize_fn
 
-def reg_fn(score_fn, x, labels, rng, k: int):
-  # split RNG for each probe
-  keys = jax.random.split(rng, k)
 
-  def one_probe(key):
-    # draw eps from Rademacher
-    eps = jax.random.rademacher(key, x.shape).astype(x.dtype)
-    # compute JVP:  jvp(score_fn, (x,), (z,)) -> (score, J⋅z)
-    _, jvp = jax.jvp(lambda v: score_fn(v, labels), (x,), (eps,))
-    # inner product (z⋅(Jz))^2 for each sample, then flatten over pixels/channels
-    return jnp.sum(jnp.square(eps * jvp), axis=tuple(range(1, eps.ndim)))
+def reg_fn(score_fn, x, labels, rng, k: int, strategy: str, vector: str, moment: str):
 
-  # vmapped over probes gives shape (num_probes, batch)
-  traces = jax.vmap(one_probe)(keys)
-  # average over probes → (batch,)
-  return jnp.mean(traces, axis=0)
+    if k <= 0:
+        # shape (batch,)
+        return jnp.zeros(x.shape[0], dtype=x.dtype), 0, 0
 
-def get_sde_loss_fn(sde, model, train, reduce_mean=True, continuous=True, likelihood_weighting=True, eps=1e-5, k=0, gamma=0.0):
+    def sample_noise(key):
+        if vector == 'rademacher':
+            return jax.random.rademacher(key, x.shape).astype(x.dtype)
+        elif vector == 'gaussian':
+            return jax.random.normal(key, x.shape).astype(x.dtype)
+        else:
+            raise ValueError(f"Unknown vector type {vector!r}")
+
+    def compute_trace(eps, jvp):
+        trace = jnp.sum(eps * jvp, axis=tuple(range(1, x.ndim)))
+        if moment == 'first':
+            return trace
+        elif moment == 'second':
+            return trace**2
+        else:
+            raise ValueError(f"Unknown moment {moment!r}")
+
+    tracemalloc.start()
+    t0 = time.time()
+
+    if strategy == 'memory':
+        acc = jnp.zeros(x.shape[0], dtype=x.dtype)
+        for _ in range(k):
+            rng, key = jax.random.split(rng)
+            eps = sample_noise(key)
+            _, jvp = jax.jvp(lambda v: score_fn(v, labels), (x,), (eps,))
+            acc = acc + compute_trace(eps, jvp)
+        result = acc / k
+
+    elif strategy == 'vmap':
+        rngs = jax.random.split(rng, k)
+        def single(key):
+            eps = sample_noise(key)
+            _, jvp = jax.jvp(lambda v: score_fn(v, labels), (x,), (eps,))
+            return compute_trace(eps, jvp)
+        traces = jax.vmap(single)(rngs)  # shape (k, batch)
+        result = jnp.mean(traces, axis=0)
+
+    else:
+        raise ValueError(f"Unknown strategy {strategy!r}")
+
+    # stop measuring
+    elapsed = time.time() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    return result, elapsed, peak
+
+
+def get_sde_loss_fn(sde, model, train, reduce_mean=True, continuous=True, likelihood_weighting=True, eps=1e-5,
+            k = 0, gamma = 0.0, strategy = 'memory', vector = 'rademacher', moment = 'second',
+            comp_k = 0, comp_strategy = 'memory', comp_vector = 'rademacher', comp_moment = 'second'):
+
   """Create a loss function for training with arbirary SDEs.
 
   Args:
@@ -137,22 +182,40 @@ def get_sde_loss_fn(sde, model, train, reduce_mean=True, continuous=True, likeli
       return score_fn(x_in, t_in, rng=step_rng)[0]
 
     rng, reg_rng = random.split(rng)
-    raw_reg = reg_fn(
+    raw_reg, elapsed, peak = reg_fn(
       score_fn=pure_score,
       x=perturbed_data,
       labels=t,
       rng=reg_rng,
-      k=k
+      k=k,
+      strategy=strategy,
+      moment=moment,
+      vector=vector
     )
-    reg = gamma * jnp.mean(raw_reg)
+    reg = jnp.mean(raw_reg)
 
-    loss = base_loss + reg
-    return loss, (new_model_state, reg)
+    loss = base_loss + gamma * reg
+
+    comp_raw_reg, comp_elapsed, comp_peak = reg_fn(
+      score_fn=pure_score,
+      x=perturbed_data,
+      labels=t,
+      rng=reg_rng,
+      k=comp_k,
+      strategy=comp_strategy,
+      moment=comp_moment,
+      vector=comp_vector
+    )
+    comp_reg = jnp.mean(comp_raw_reg)
+
+    return loss, (new_model_state, base_loss, reg, elapsed, peak, comp_reg, comp_elapsed, comp_peak)
 
   return loss_fn
 
 
-def get_smld_loss_fn(vesde, model, train, reduce_mean=False, k=0, gamma=0.0):
+def get_smld_loss_fn(vesde, model, train, reduce_mean=False,
+                     k=0, gamma=0.0, strategy='memory', vector='rademacher', moment='second',
+                     comp_k=0, comp_strategy='memory', comp_vector='rademacher', comp_moment='second'):
   """Legacy code to reproduce previous results on SMLD(NCSN). Not recommended for new work."""
   assert isinstance(vesde, VESDE), "SMLD training only works for VESDEs."
 
@@ -181,22 +244,40 @@ def get_smld_loss_fn(vesde, model, train, reduce_mean=False, k=0, gamma=0.0):
       return model_fn(x_in, lbl_in, rng=step_rng)[0]
 
     rng, reg_rng = random.split(rng)
-    raw_reg = reg_fn(
+    raw_reg, elapsed, peak = reg_fn(
       score_fn=pure_score,
       x=perturbed_data,
       labels=labels,
       rng=reg_rng,
-      k=k
+      k=k,
+      strategy=strategy,
+      moment=moment,
+      vector=vector
     )
-    reg = gamma * jnp.mean(raw_reg)
+    reg = jnp.mean(raw_reg)
 
-    loss = base_loss + reg
-    return loss, (new_model_state, reg)
+    loss = base_loss + gamma * reg
+
+    comp_raw_reg, comp_elapsed, comp_peak = reg_fn(
+        score_fn=pure_score,
+        x=perturbed_data,
+        labels=labels,
+        rng=reg_rng,
+        k=comp_k,
+        strategy=comp_strategy,
+        moment=comp_moment,
+        vector=comp_vector
+    )
+    comp_reg = jnp.mean(comp_raw_reg)
+
+    return loss, (new_model_state, base_loss, reg, elapsed, peak, comp_reg, comp_elapsed, comp_peak)
 
   return loss_fn
 
 
-def get_ddpm_loss_fn(vpsde, model, train, reduce_mean=True, k=0, gamma=0.0):
+def get_ddpm_loss_fn(vpsde, model, train, reduce_mean=True,
+                     k=0, gamma=0.0, strategy='memory', vector='rademacher', moment='second',
+                     comp_k=0, comp_strategy='memory', comp_vector='rademacher', comp_moment='second'):
   """Legacy code to reproduce previous results on DDPM. Not recommended for new work."""
   assert isinstance(vpsde, VPSDE), "DDPM training only works for VPSDEs."
 
@@ -224,22 +305,40 @@ def get_ddpm_loss_fn(vpsde, model, train, reduce_mean=True, k=0, gamma=0.0):
       return model_fn(x_in, lbl_in, rng=step_rng)[0]
 
     rng, reg_rng = random.split(rng)
-    raw_reg = reg_fn(
+    raw_reg, elapsed, peak = reg_fn(
       score_fn=pure_score,
       x=perturbed_data,
       labels=labels,
       rng=reg_rng,
-      k=k
+      k=k,
+      strategy=strategy,
+      moment=moment,
+      vector=vector
     )
-    reg = gamma * jnp.mean(raw_reg)
+    reg = jnp.mean(raw_reg)
 
-    loss = base_loss + reg
-    return loss, (new_model_state, reg)
+    loss = base_loss + gamma * reg
+
+    comp_raw_reg, comp_elapsed, comp_peak = reg_fn(
+        score_fn=pure_score,
+        x=perturbed_data,
+        labels=labels,
+        rng=reg_rng,
+        k=comp_k,
+        strategy=comp_strategy,
+        moment=comp_moment,
+        vector=comp_vector
+    )
+    comp_reg = jnp.mean(comp_raw_reg)
+
+    return loss, (new_model_state, base_loss, reg, elapsed, peak, comp_reg, comp_elapsed, comp_peak)
 
   return loss_fn
 
 
-def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False, k: float=0.0, gamma: float=0.0):
+def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False,
+                k: int=0, gamma: float=0.0, strategy: str='memory', vector: str='rademacher', moment: str='second',
+                comp_k: int=0, comp_strategy: str='memory', comp_vector: str='rademacher', comp_moment: str='first'):
   """Create a one-step training/evaluation function.
 
   Args:
@@ -256,14 +355,19 @@ def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuo
     A one-step function for training or evaluation.
   """
   if continuous:
-    loss_fn = get_sde_loss_fn(sde, model, train, reduce_mean=reduce_mean,
-                              continuous=True, likelihood_weighting=likelihood_weighting, k=k, gamma=k)
+    loss_fn = get_sde_loss_fn(sde, model, train, reduce_mean=reduce_mean, continuous=True, likelihood_weighting=likelihood_weighting,
+                              k=k, gamma=gamma, strategy=strategy, vector=vector, moment=moment,
+                              comp_k=comp_k, comp_strategy=comp_strategy, comp_vector=comp_vector, comp_moment=comp_moment)
   else:
     assert not likelihood_weighting, "Likelihood weighting is not supported for original SMLD/DDPM training."
     if isinstance(sde, VESDE):
-      loss_fn = get_smld_loss_fn(sde, model, train, reduce_mean=reduce_mean, k=k, gamma=gamma)
+      loss_fn = get_smld_loss_fn(sde, model, train, reduce_mean=reduce_mean,
+                                 k=k, gamma=gamma, strategy=strategy, vector=vector, moment=moment,
+                                 comp_k=comp_k, comp_strategy=comp_strategy, comp_vector=comp_vector,comp_moment=comp_moment)
     elif isinstance(sde, VPSDE):
-      loss_fn = get_ddpm_loss_fn(sde, model, train, reduce_mean=reduce_mean, k=k, gamma=gamma)
+      loss_fn = get_ddpm_loss_fn(sde, model, train, reduce_mean=reduce_mean,
+                                 k=k, gamma=gamma, strategy=strategy, vector=vector, moment=moment,
+                                 comp_k=comp_k, comp_strategy=comp_strategy, comp_vector=comp_vector,comp_moment=comp_moment)
     else:
       raise ValueError(f"Discrete training for {sde.__class__.__name__} is not recommended.")
 
@@ -288,7 +392,7 @@ def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuo
     if train:
       params = state.optimizer.target
       states = state.model_state
-      (loss, (new_model_state, reg)), grad = grad_fn(step_rng, params, states, batch)
+      (loss, (new_model_state, base_loss, reg, elapsed, peak, comp_reg, comp_elapsed, comp_peak)), grad = grad_fn(step_rng, params, states, batch)
       grad = jax.lax.pmean(grad, axis_name='batch')
       new_optimizer = optimize_fn(state, grad)
       new_params_ema = jax.tree_multimap(
@@ -303,12 +407,20 @@ def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuo
         params_ema=new_params_ema
       )
     else:
-      (loss, (_, reg)) = loss_fn(step_rng, state.params_ema, state.model_state, batch)
+      (loss, (_, base_loss, reg, elapsed, peak, comp_reg, comp_elapsed, comp_peak)) = loss_fn(step_rng, state.params_ema, state.model_state, batch)
       new_state = state
 
     loss = jax.lax.pmean(loss, axis_name='batch')
+    base_loss = jax.lax.pmean(base_loss, axis_name='batch')
     reg = jax.lax.pmean(reg, axis_name='batch')
+    elapsed = jax.lax.pmean(elapsed, axis_name='batch')
+    peak = jax.lax.pmean(peak, axis_name='batch')
+    comp_reg = jax.lax.pmean(comp_reg, axis_name='batch')
+    comp_elapsed = jax.lax.pmean(comp_elapsed, axis_name='batch')
+    comp_peak = jax.lax.pmean(comp_peak, axis_name='batch')
+
     new_carry_state = (rng, new_state)
-    return new_carry_state, {'loss': loss, 'reg': reg}
+    return new_carry_state, {'loss': loss, 'base': base_loss, 'reg': reg, 'elapsed': elapsed, 'peak': peak,
+                             'comp reg': comp_reg, 'comp elapsed': comp_elapsed, 'comp peak': comp_peak}
 
   return step_fn

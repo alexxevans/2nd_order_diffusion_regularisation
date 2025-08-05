@@ -20,8 +20,17 @@ def get_default_configs():
   training.reduce_mean = False
 
   # 2nd order regularisation
-  training.k=0
-  training.gamma=0.0
+  config.reg = regularisation = ml_collections.ConfigDict()
+  regularisation.k=0
+  regularisation.gamma=0.0
+  regularisation.strategy='memory'
+  regularisation.vector='rademacher'
+  regularisation.moment='second'
+
+  regularisation.comp_k=0
+  regularisation.comp_strategy='memory'
+  regularisation.comp_vector='rademacher'
+  regularisation.comp_moment='first'
 
   # sampling
   config.sampling = sampling = ml_collections.ConfigDict()

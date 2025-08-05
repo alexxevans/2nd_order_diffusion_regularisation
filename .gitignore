@@ -19,3 +19,6 @@ dist/
 
 # Other
 *.DS_Store
+/.venv/
+/experiments/
+/assets/

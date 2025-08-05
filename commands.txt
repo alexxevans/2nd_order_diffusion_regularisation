@@ -1,0 +1,20 @@
+python main.py \
+--config=./configs/ve/cifar10_ddpm.py \
+--mode=train \
+--workdir=./experiments/cifar10_ddpm \
+--config.reg.k=0 \
+--config.reg.gamma=1.2 \
+--config.reg.comp_k=1
+
+python main.py \
+--config=./configs/ve/cifar10_ddpm.py \
+--mode=eval \
+--workdir=./experiments/cifar10_ddpm \
+--config.eval.begin_ckpt=0 \
+--config.eval.end_ckpt=0 \
+--config.eval.enable_sampling=True \
+--config.eval.enable_bpd=False
+
+
+python main.py   --config=./configs/ve/cifar10_ddpm.py   --mode=eval   --workdir=./experiments/cifar10_ddpm   --eval_folder=eval   --config.eval.begin_ckpt=0   --config.eval.end_ckpt=0   --config.eval.enable_sampling=True   --config.eval.enable_bpd=False   # ← disable BPD
+

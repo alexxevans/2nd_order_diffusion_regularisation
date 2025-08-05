@@ -122,13 +122,19 @@ def train(config, workdir):
   train_step_fn = losses.get_step_fn(sde, score_model, train=True, optimize_fn=optimize_fn,
                                      reduce_mean=reduce_mean, continuous=continuous,
                                      likelihood_weighting=likelihood_weighting,
-                                     k=config.training.k, gamma=config.training.gamma)
+                                     k=config.reg.k, gamma=config.reg.gamma,
+                                     strategy=config.reg.strategy, vector=config.reg.vector, moment=config.reg.moment,
+                                     comp_k = config.reg.comp_k, comp_strategy = config.reg.comp_strategy,
+                                     comp_vector = config.reg.comp_vector, comp_moment = config.reg.comp_moment)
   # Pmap (and jit-compile) multiple training steps together for faster running
   p_train_step = jax.pmap(functools.partial(jax.lax.scan, train_step_fn), axis_name='batch', donate_argnums=1)
   eval_step_fn = losses.get_step_fn(sde, score_model, train=False, optimize_fn=optimize_fn,
                                     reduce_mean=reduce_mean, continuous=continuous,
                                     likelihood_weighting=likelihood_weighting,
-                                    k=config.training.k, gamma=config.training.gamma)
+                                    k=config.reg.k, gamma=config.reg.gamma,
+                                    strategy=config.reg.strategy, vector=config.reg.vector, moment=config.reg.moment,
+                                    comp_k=config.reg.comp_k, comp_strategy=config.reg.comp_strategy,
+                                    comp_vector=config.reg.comp_vector, comp_moment=config.reg.comp_moment)
   # Pmap (and jit-compile) multiple evaluation steps together for faster running
   p_eval_step = jax.pmap(functools.partial(jax.lax.scan, eval_step_fn), axis_name='batch', donate_argnums=1)
 
@@ -166,9 +172,18 @@ def train(config, workdir):
     # Log to console, file and tensorboard on host 0
     if jax.host_id() == 0 and step % config.training.log_freq == 0:
       train_loss = float(train_metrics['loss'])
+      train_base = float(train_metrics['base'])
       train_reg = float(train_metrics['reg'])
+      train_elapsed = float(train_metrics['elapsed'])
+      train_peak = float(train_metrics['peak'])
+      train_comp_reg = float(train_metrics['comp reg'])
+      train_comp_elapsed = float(train_metrics['comp elapsed'])
+      train_comp_peak = float(train_metrics['comp peak'])
 
-      logging.info(f"step: {step}, (TRAIN) loss: {train_loss:.5e}, reg: {train_reg:.5e}")
+      logging.info(f"step: {step}, (TRAIN) loss: {train_loss:.5e}, base: {train_base:.5e}, reg: {train_reg:.5e}, time: {train_elapsed:.5e}, memory: {train_peak:.5e}")
+      if train_comp_reg != 0:
+        logging.info(f"step: {step}, (TRAIN COMPARISON) reg: {train_comp_reg:.5e}, time: {train_comp_elapsed:.5e}, memory: {train_comp_peak:.5e}")
+
       writer.scalar("training_loss", train_loss, step)
       writer.scalar("training_reg", train_reg, step)
 
@@ -190,9 +205,17 @@ def train(config, workdir):
 
       if jax.host_id() == 0:
         eval_loss = float(eval_metrics['loss'])
+        eval_base = float(eval_metrics['base'])
         eval_reg = float(eval_metrics['reg'])
+        eval_elapsed = float(eval_metrics['elapsed'])
+        eval_peak = float(eval_metrics['peak'])
+        eval_comp_reg = float(eval_metrics['comp reg'])
+        eval_comp_elapsed = float(eval_metrics['comp elapsed'])
+        eval_comp_peak = float(eval_metrics['comp peak'])
 
-        logging.info(f"step: {step}, (EVAL) loss: {eval_loss:.5e}, reg: {eval_reg:.5e}")
+        logging.info(f"step: {step}, (EVAL) loss: {eval_loss:.5e}, base: {eval_base:.5e}, reg: {eval_reg:.5e}, time: {eval_elapsed:.5e}, memory: {eval_peak:.5e}")
+        if eval_comp_reg != 0:
+          logging.info(f"step: {step}, (EVAL COMPARISON) reg: {eval_comp_reg:.5e}, time: {eval_comp_elapsed:.5e}, memory: {eval_comp_peak:.5e}")
         writer.scalar("eval_loss", eval_loss, step)
         writer.scalar("eval_reg", eval_reg, step)
 
@@ -390,11 +413,23 @@ def evaluate(config,
         eval_batch = jax.tree_map(lambda x: scaler(x._numpy()), batch)  # pylint: disable=protected-access
         rng, *next_rng = jax.random.split(rng, num=jax.local_device_count() + 1)
         next_rng = jnp.asarray(next_rng)
-        (_, _), p_eval_loss = p_eval_step((next_rng, pstate), eval_batch)
-        eval_loss = flax.jax_utils.unreplicate(p_eval_loss)
-        all_losses.extend(eval_loss)
+
+        (_, _), p_eval_metrics = p_eval_step((next_rng, pstate), eval_batch)
+        eval_metrics = flax.jax_utils.unreplicate(p_eval_metrics)
+
+        eval_loss = float(eval_metrics['loss'])
+        eval_reg = float(eval_metrics['reg'])
+
+        all_losses.append(eval_loss)
+
         if (i + 1) % 1000 == 0 and jax.host_id() == 0:
           logging.info("Finished %dth step loss evaluation" % (i + 1))
+
+      # --- Diagnostics start ---
+      print(f"▶︎ Number of loss entries: {len(all_losses)}")
+      for idx, val in enumerate(all_losses):
+          print(f"  [{idx}] type={type(val)}, repr={repr(val)}")
+      # --- Diagnostics end ---
 
       # Save loss values to disk or Google Cloud Storage
       all_losses = jnp.asarray(all_losses)
@@ -552,7 +587,7 @@ def evaluate(config,
           tf_data_pools, tf_all_pools).numpy()
         del tf_data_pools, tf_all_pools
 
-        k = getattr(config.eval, "prdc_k", 5)
+        k = getattr(config.eval, "prdc_k", 5) # CHOOSE SUITABLE PARAMETERS??
 
         rng = np.random.RandomState(config.seed)
         real_idx = rng.choice(data_pools.shape[0], size=128, replace=False) # RANDOM SUB-SECTION OF SAMPLES
